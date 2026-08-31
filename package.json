@@ -2,6 +2,7 @@
   "name": "@short-arm-ape/dsh-intranet-browser",
   "version": "0.1.0",
   "type": "module",
+  "packageManager": "pnpm@11.24.0",
   "description": "Bypasses the SSRF protection of @yeesy369/dsh-browser-playwright.",
   "license": "MIT",
   "publishConfig": {
