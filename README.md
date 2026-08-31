@@ -1,13 +1,13 @@
 # dsh-intranet-browser
-Bypasses the SSRF protection of @yeesy369dsh-browser-playwright
+Bypasses the SSRF protection of `@yeesy369/dsh-browser-playwright`
 
 [中文](https://github.com/Short-Arm-Ape/dsh-intranet-browser/blob/main/%E8%AF%B4%E6%98%8E%20.md)
 
 # Overview
 
-This plugin is modified by @yeesy369/dsh-browser-playwright and relies on the upstream plugin [@xylt369/dsh-browser](https://github.com/xylt369/dsh-browser/).
+This plugin is modified from [`@yeesy369/dsh-browser-playwright`](https://www.npmjs.com/package/@yeesy369/dsh-browser-playwright) (upstream source repo: [xylt369/dsh-browser](https://github.com/xylt369/dsh-browser/)) and keeps the same runtime dependency on the service-definition package [`@yeesy369/dsh-browser`](https://www.npmjs.com/package/@yeesy369/dsh-browser).
 
-This plugin will **⚠️bypass the SSRF protection** of the original plugin (`url-guard. ts`) to facilitate DeepSeek Harness to open local and LAN for page debugging.It will invoke an independent Playwright instance (independent service name, independent profile directory, independent window). 
+This plugin will **⚠️bypass the SSRF protection** of the original plugin (`url-guard.ts`) to facilitate DeepSeek Harness to open local and LAN for page debugging. It will invoke an independent Playwright instance (independent service name, independent profile directory, independent window).
 
 For security reasons, **every `intranet_*` tool call is gated behind user approval** (default `approvalMode: 'per-call'`), and cloud-metadata endpoints stay blocked by default.
 
@@ -25,33 +25,46 @@ The two browsers can run side by side.
 
 # Dependency and adaptation version
 
-| Name | Version |
-|---------|---------|
-| [`xylt369/dsh-browser`](https://github.com/xylt369/dsh-browser/) | `0.8.1` |
-| [`DeepSeek Harness`](https://github.com/deepseek-ai/deepseek-harness) | `0.1.0-rc.7` |
+| Name | Role | Version |
+|---------|---------|---------|
+| [`xylt369/dsh-browser`](https://github.com/xylt369/dsh-browser/) | Upstream source repo (adapted from `@yeesy369/dsh-browser-playwright`) | `0.8.1` |
+| [`@yeesy369/dsh-browser`](https://www.npmjs.com/package/@yeesy369/dsh-browser) | Runtime dependency (`dependencies`: service-definition types) | `^0.6.0` |
+| [`DeepSeek Harness`](https://github.com/deepseek-ai/deepseek-harness) | Target host (`dsh` CLI) | `0.1.0-rc.7` / `0.1.1-rc.2` |
 
 # Development & Quick start
 
-## 1.Install [xylt369/dsh-browser](https://github.com/xylt369/dsh-browser/blob/main/README.en.md#install)
+## 1. Prerequisites
 
-## 2.Download source code & Build the package
+- [DeepSeek Harness CLI (`dsh`)](https://www.npmjs.com/package/@deepseek-ai/dsh): `npm i -g @deepseek-ai/dsh`
+- Node.js ≥ 18 and [pnpm](https://pnpm.io/installation) (`npm i -g pnpm`)
+
+## 2. Build the package
 
 Execute in [absolute path to this package]:
 ```sh
 pnpm install
-```
-If you want to conduct a test:
-
-```sh
-pnpm --filter Short-Arm-Ape/dsh-intranet-browser build
-pnpm --filter Short-Arm-Ape/dsh-intranet-browser typecheck
-pnpm --filter Short-Arm-Ape/dsh-intranet-browser test
+pnpm build      # tsc → lib/, then the client bundle → lib/client.js
+pnpm typecheck
+pnpm test
 ```
 
 Unit tests cover the URL policy (metadata block, file/credentials/scheme checks) and the approval-gate decision logic; real-browser behavior can be verified following `browser-playwright`'s e2e pattern.
 
-## 3.Add to DeepSeek Harness:
+## 3. Manually install into DeepSeek Harness (web profile)
 
+The package installs from its local path — no npm publish needed.
+
+Windows one-click:
+```sh
+powershell -ExecutionPolicy Bypass -File scripts/install.ps1
+```
+
+macOS / Linux one-click:
+```sh
+bash scripts/install.sh
+```
+
+Or manually (the script does exactly this):
 ```sh
 dsh plugin --profile web add [absolute path to this package]
 ```
@@ -59,6 +72,12 @@ dsh plugin --profile web add [absolute path to this package]
 If there is a running DeepSeek Harness instance, restart it.
 
 The AI calls `intranet_open`; an approval prompt appears (per call by default); only after you approve does navigation happen. Then keep debugging with `intranet_snapshot` / `intranet_click` / `intranet_screenshot` …
+
+# Uninstall
+
+```sh
+dsh plugin --profile web remove @short-arm-ape/dsh-intranet-browser
+```
 
 # Tools
 
