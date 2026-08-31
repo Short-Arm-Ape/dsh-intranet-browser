@@ -1,6 +1,8 @@
 # dsh-intranet-browser
 Bypasses the SSRF protection of @yeesy369dsh-browser-playwright
 
+[中文](https://github.com/Short-Arm-Ape/dsh-intranet-browser/blob/main/%E8%AF%B4%E6%98%8E%20.md)
+
 # Overview
 
 This plugin is modified by @yeesy369/dsh-browser-playwright and relies on the upstream plugin [@xylt369/dsh-browser](https://github.com/xylt369/dsh-browser/).
