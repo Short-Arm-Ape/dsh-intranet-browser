@@ -25,8 +25,8 @@ import { IntranetBrowserRuntime } from './runtime.js'
 import { registerIntranetTools } from './tools.js'
 
 export const name = 'intranet-browser'
-/** Wait for Host settings so `register(..., { expose: 'web' })` actually runs. */
-export const inject = ['settings', 'tools', 'attachments']
+/** Wait for Host settings, tools, attachments, and the approval service so the gate can always ask. */
+export const inject = ['settings', 'tools', 'attachments', 'approval']
 
 export const Config: Schema<IntranetConfig> = Schema.object({
   approvalMode: Schema.union(['per-call', 'arm']).default('per-call').description(
@@ -35,9 +35,13 @@ export const Config: Schema<IntranetConfig> = Schema.object({
     'Approval granularity: per-call = every intranet_* call asks the user (default, strictest); arm = approve intranet_arm once, then later intranet_* calls run without prompts until intranet_disarm. ' +
     'Note: when the session approval policy is never (Full access / danger-full-access), intranet_* calls auto-pass (matching the trust level of other tools) and this setting is moot.',
   ),
+  approvalScope: Schema.union(['all', 'navigation']).default('all').description(
+    '授权范围：all = 所有 intranet_* 调用都弹窗（默认）；navigation = 只读操作（intranet_snapshot / intranet_screenshot / intranet_scroll / intranet_wait / intranet_list_tabs）不再逐个弹窗，导航/写操作仍每次弹窗。' +
+    'Approval scope: all = every intranet_* call prompts (default); navigation = read-only calls run without prompts, navigation/write calls still prompt.',
+  ),
   blockMetadata: Schema.boolean().default(true).description(
-    '即使绕过了 SSRF 防护，仍默认拦截云元数据端点（169.254.169.254、metadata.google.internal 等）。只在完全受控的网络（如云主机上专门测元数据）才建议关闭。' +
-    'Keep blocking cloud-metadata endpoints even though SSRF protection is bypassed. Defaults to true; disable only on fully controlled networks.',
+    '即使绕过了 SSRF 防护，仍默认拦截云元数据端点（169.254.169.254、metadata.google.internal 等）。该黑名单在导航入口和所有请求（含重定向/XHR/iframe）两个层面生效。只在完全受控的网络（如云主机上专门测元数据）才建议关闭。' +
+    'Keep blocking cloud-metadata endpoints even though SSRF protection is bypassed, at both the navigation entry and every request (redirects/XHR/iframes included). Defaults to true; disable only on fully controlled networks.',
   ),
   blockedHostnames: Schema.array(String).default([]).description(
     '额外始终拦截的主机名或 IP 字面量（在元数据列表之外）。Extra hostnames or IP literals that are always blocked.',
@@ -61,15 +65,27 @@ export const Config: Schema<IntranetConfig> = Schema.object({
   maxWaitMs: Schema.number().default(60_000).description(
     'intranet_wait 的等待上限（毫秒）。Upper bound for intranet_wait in milliseconds.',
   ),
+  navigationTimeoutMs: Schema.number().default(60_000).description(
+    '导航超时（intranet_open / intranet_back / intranet_forward，毫秒）。Navigation timeout in milliseconds.',
+  ),
+  interactionTimeoutMs: Schema.number().default(30_000).description(
+    '交互超时（intranet_click / intranet_fill / intranet_press，毫秒）。Interaction timeout in milliseconds.',
+  ),
+  evaluate: Schema.boolean().default(false).description(
+    '暴露 intranet_evaluate 工具（在页面里执行原始 JS，高风险）。默认关闭；工具在插件加载时注册，修改后需重启生效。' +
+    'Expose the intranet_evaluate tool (raw JS in the page, HIGH RISK). Defaults to false; registered at plugin load, so a change needs a restart.',
+  ),
 })
 
 export function apply(ctx: Context, config: IntranetConfig): void {
   const settings = ctx.get('settings') as SettingsProvider
+  // Note: web exposure of the settings card is declared by `dsh.client` in
+  // package.json (the inject list), not by a register option — the legacy
+  // `expose` option no longer exists in dsh-settings.
   const registered = settings.register(settingsNamespace(name), Config, {
     base: config,
     applies: 'live',
-    expose: 'web',
-  } as Parameters<SettingsProvider['register']>[2])
+  })
   const getConfig = (): IntranetConfig => registered.get()
 
   // Arm/disarm state, keyed by agent id, shared with the approval gate.
@@ -83,6 +99,11 @@ export function apply(ctx: Context, config: IntranetConfig): void {
       armedAgents.delete(agentId)
     },
   }
+  // Agents come and go (sessions end, forks dispose); drop their arm state so
+  // the set cannot grow for the process lifetime. agent id === session id.
+  ctx.on('agent/disposed', ({ agent }: { agent?: { id?: string } }) => {
+    if (agent && typeof agent.id === 'string') armedAgents.delete(agent.id)
+  })
 
   // The standalone intranet browser service: constructed directly (its own
   // service name `intranet-browser` never collides with `browser`).

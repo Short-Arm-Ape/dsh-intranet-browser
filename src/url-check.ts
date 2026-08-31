@@ -9,8 +9,15 @@
  * operator explicitly disables it. The original browser instance
  * (`browser-playwright`) is NOT affected — it keeps its strict url-guard.
  *
- * Every URL that passes this check is still routed through the plugin's
- * approval gate (see gate.ts) before any navigation happens.
+ * The blocklist is enforced in two places:
+ *  1. `assertUsableUrl` — the initial navigation URL, before `page.goto`.
+ *  2. `blockReasonForUrl` — every request of the browser context, via a
+ *     context-level route handler, so redirect targets, XHR/fetch, iframes and
+ *     other subresources are covered too (a 302 from an approved page onto a
+ *     metadata endpoint is aborted before it loads).
+ *
+ * Every URL that passes is still routed through the plugin's approval gate
+ * (see gate.ts) before any navigation happens.
  *
  * @module dsh-intranet-browser/url-check
  */
@@ -31,11 +38,14 @@ export const METADATA_HOSTNAMES: ReadonlySet<string> = new Set([
   'metadata.google.internal',
   'instance-data',
   'instance-data.ec2.internal',
+  'metadata.azure.internal', // Azure IMDS hostname
+  'metadata.tencentyun.com', // Tencent Cloud metadata
 ])
 
 /** Cloud-metadata IP literals blocked by default. */
 export const METADATA_IPS: ReadonlySet<string> = new Set([
   '169.254.169.254', // AWS / GCP / Azure instance metadata
+  '100.100.100.200', // Alibaba Cloud instance metadata
   'fd00:ec2::254', // AWS IMDSv2 IPv6
 ])
 
@@ -53,6 +63,69 @@ export interface IntranetUrlOptions {
   blockedHostnames?: ReadonlySet<string>
 }
 
+/**
+ * Normalize a hostname for blocklist matching:
+ * - strips IPv6 brackets and lowercases,
+ * - strips trailing dots (FQDN root form, e.g. `metadata.google.internal.`),
+ * - maps IPv4-mapped IPv6 literals back to their embedded IPv4 dotted quad
+ *   (the WHATWG URL parser renders `[::ffff:169.254.169.254]` as the hex form
+ *   `::ffff:a9fe:a9fe`, which a literal match would miss).
+ *
+ * Integer / hex / octal IPv4 variants (e.g. `http://2852039166/`) are already
+ * normalized to dotted-quad form by the URL parser itself, so they match here
+ * with no extra work.
+ */
+export function normalizeHostname(raw: string): string {
+  let host = raw.replace(/^\[|\]$/g, '').toLowerCase()
+  while (host.endsWith('.')) host = host.slice(0, -1)
+  if (host.startsWith('::ffff:')) {
+    const v4 = ipv6TailToIpv4(host.slice('::ffff:'.length))
+    if (v4) return v4
+  }
+  return host
+}
+
+/** Interpret the tail of an IPv4-mapped IPv6 literal as a dotted quad. */
+function ipv6TailToIpv4(tail: string): string | null {
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(tail)) return tail
+  // Tail is 1-2 16-bit groups (e.g. `a9fe:a9fe` or `7f00:1` for 127.0.0.1);
+  // pad each group to 4 hex digits so the concatenation is the full 32 bits.
+  const parts = tail.split(':')
+  if (parts.length > 2) return null
+  let hex = ''
+  for (const part of parts) {
+    if (!/^[0-9a-f]{1,4}$/.test(part)) return null
+    hex += part.padStart(4, '0')
+  }
+  if (hex.length !== 8) return null
+  const n = Number.parseInt(hex, 16)
+  return `${(n >>> 24) & 0xff}.${(n >>> 16) & 0xff}.${(n >>> 8) & 0xff}.${n & 0xff}`
+}
+
+/**
+ * Blocklist check usable against ANY request URL (navigation, redirect target,
+ * subresource). Returns a human-readable reason when the request must be
+ * blocked, or `null` when it may proceed. Invalid URLs fail open (the strict
+ * navigation check still covers the initial `goto`).
+ */
+export function blockReasonForUrl(raw: string | URL, options: IntranetUrlOptions = {}): string | null {
+  let url: URL
+  try {
+    url = typeof raw === 'string' ? new URL(raw) : raw
+  } catch {
+    return null
+  }
+  const host = normalizeHostname(url.hostname)
+  const extra = options.blockedHostnames ?? new Set<string>()
+  if (extra.has(host)) {
+    return `Hostname is blocked by intranet-browser config: ${host}`
+  }
+  if ((options.blockMetadata ?? true) && (METADATA_HOSTNAMES.has(host) || METADATA_IPS.has(host))) {
+    return `Cloud metadata endpoint is blocked: ${host}`
+  }
+  return null
+}
+
 export interface IntranetUrlCheck {
   /**
    * Validate `raw` for the intranet browser: http(s) (optionally file) only,
@@ -65,8 +138,6 @@ export interface IntranetUrlCheck {
 /** Build a permissive-but-not-naked URL check for the intranet browser. */
 export function createIntranetUrlCheck(options: IntranetUrlOptions = {}): IntranetUrlCheck {
   const allowFile = options.allowFile ?? false
-  const blockMetadata = options.blockMetadata ?? true
-  const extra = options.blockedHostnames ?? new Set<string>()
 
   function parse(raw: string): URL {
     let url: URL
@@ -88,24 +159,11 @@ export function createIntranetUrlCheck(options: IntranetUrlOptions = {}): Intran
     return url
   }
 
-  function hostOf(url: URL): string {
-    return url.hostname.replace(/^\[|\]$/g, '').toLowerCase()
-  }
-
-  function assertAllowed(url: URL): void {
-    const host = hostOf(url)
-    if (extra.has(host)) {
-      throw new IntranetUrlError('WEB_BLOCKED_URL', `Hostname is blocked by intranet-browser config: ${host}`)
-    }
-    if (blockMetadata && (METADATA_HOSTNAMES.has(host) || METADATA_IPS.has(host))) {
-      throw new IntranetUrlError('WEB_BLOCKED_URL', `Cloud metadata endpoint is blocked: ${host}`)
-    }
-  }
-
   return {
     assertUsableUrl(raw: string): URL {
       const url = parse(raw)
-      assertAllowed(url)
+      const reason = blockReasonForUrl(url, options)
+      if (reason) throw new IntranetUrlError('WEB_BLOCKED_URL', reason)
       return url
     },
   }

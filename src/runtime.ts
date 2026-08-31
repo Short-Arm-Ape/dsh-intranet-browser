@@ -18,7 +18,7 @@ import { Service, type Context } from '@deepseek-ai/cordis'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { chromium, type Browser, type BrowserContext, type Page } from 'playwright'
+import { chromium, type BrowserContext, type Page } from 'playwright'
 import {
   BrowserError,
   type BrowserActionResult,
@@ -37,7 +37,7 @@ import {
   STEALTH_INIT_SCRIPT,
   STEALTH_LAUNCH_ARGS,
 } from './stealth.js'
-import { createIntranetUrlCheck, type IntranetUrlCheck } from './url-check.js'
+import { blockReasonForUrl, createIntranetUrlCheck, type IntranetUrlCheck } from './url-check.js'
 
 /**
  * Prefer a locally installed real browser — Microsoft Edge first, then Chrome;
@@ -96,7 +96,6 @@ interface SessionState {
  * original provider). Consumed by the `intranet_*` tools via closure.
  */
 export class IntranetBrowserRuntime extends Service {
-  private browser: Browser | null = null
   private context: BrowserContext | null = null
   private readonly sessions = new Map<string, SessionState>()
   private readonly claimed = new WeakSet<Page>()
@@ -178,15 +177,10 @@ export class IntranetBrowserRuntime extends Service {
   /** Release every browser resource owned by this runtime. */
   async close(_signal?: AbortSignal): Promise<void> {
     try {
-      if (this.browser) {
-        await this.browser.close()
-      } else if (this.context) {
-        await this.context.close()
-      }
+      if (this.context) await this.context.close()
     } catch {
       // already closed — nothing to do
     }
-    this.browser = null
     this.context = null
     this.sessions.clear()
   }
@@ -224,7 +218,7 @@ export class IntranetBrowserRuntime extends Service {
 
   private wrap(page: Page, session: SessionState): IntranetPage {
     const id = `intranet-page-${this.nextPageId++}`
-    const wrapper = new IntranetPage(page, () => this.urlCheck(), id)
+    const wrapper = new IntranetPage(page, () => this.urlCheck(), id, this.getConfig)
     session.pages.set(id, wrapper)
     return wrapper
   }
@@ -255,7 +249,13 @@ export class IntranetBrowserRuntime extends Service {
   }
 
   private async ensureBrowser(options?: BrowserPageOptions): Promise<void> {
-    if (this.context && (!this.browser || this.browser.isConnected())) return
+    // The persistent context may have died (browser crash / manual window
+    // close): `launchPersistentContext` returns a context whose `browser()` is
+    // disconnected in that state. Treat it as dead and relaunch, otherwise
+    // tab-list/switch calls would hang on a zombie context.
+    const alive = this.context?.browser()?.isConnected() ?? false
+    if (this.context && !alive) await this.close()
+    if (alive) return
     const config = this.getConfig()
     const visibility = options?.windowVisibility ?? config.windowVisibility ?? 'visible'
     const headless = visibility === 'headless'
@@ -278,6 +278,23 @@ export class IntranetBrowserRuntime extends Service {
       if (config.stealth !== false) {
         await this.context.addInitScript(STEALTH_INIT_SCRIPT)
       }
+      // Blocklist enforcement at the request level: every request (redirect
+      // targets, XHR/fetch, iframes, …) is checked against the metadata
+      // blocklist and the configured extra blocklist, so an approved page
+      // cannot 302 / script its way onto a metadata endpoint.
+      await this.context.route('**/*', async (route) => {
+        const c = this.getConfig()
+        const reason = blockReasonForUrl(route.request().url(), {
+          blockMetadata: c.blockMetadata,
+          blockedHostnames: new Set(c.blockedHostnames ?? []),
+        })
+        try {
+          if (reason) await route.abort('blockedbyclient')
+          else await route.continue()
+        } catch {
+          // the request already finished (page closed / raced) — nothing to do
+        }
+      })
     } catch (cause) {
       throw new BrowserError(
         'BROWSER_LAUNCH_FAILED',
@@ -289,13 +306,14 @@ export class IntranetBrowserRuntime extends Service {
 }
 
 /** A live page inside the intranet browser context. Implements the shared `BrowserPage` contract. */
-class IntranetPage implements BrowserPage {
+export class IntranetPage implements BrowserPage {
   private lastRefs: readonly string[] = []
 
   constructor(
     private readonly page: Page,
     private readonly getCheck: () => IntranetUrlCheck,
     readonly id: string,
+    private readonly getConfig: () => Config,
   ) {}
 
   isClosed(): boolean {
@@ -315,10 +333,13 @@ class IntranetPage implements BrowserPage {
    * (localhost / LAN / private ranges allowed), only the metadata blocklist and
    * basic scheme/credential checks apply. Approval is enforced one layer up at
    * the tool gate, so a navigation only happens after the user said yes.
+   * Redirect targets are covered by the context-level route blocklist
+   * (see `ensureBrowser`), so a 302 onto a metadata endpoint is aborted.
    */
   async navigate(raw: string, _signal?: AbortSignal): Promise<BrowserNavigateResult> {
     const url = this.getCheck().assertUsableUrl(raw)
-    const response = await this.page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 60_000 })
+    const timeout = this.getConfig().navigationTimeoutMs ?? 60_000
+    const response = await this.page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout })
     return {
       url: this.page.url(),
       statusCode: response?.status() ?? null,
@@ -332,8 +353,17 @@ class IntranetPage implements BrowserPage {
     return { url: this.page.url(), text, refs: this.lastRefs }
   }
 
-  async screenshot(_signal?: AbortSignal): Promise<BrowserScreenshot> {
-    const data = await this.page.screenshot({ type: 'png', fullPage: false })
+  /**
+   * Capture a screenshot. The first parameter accepts either a `{ fullPage }`
+   * options object or a bare `AbortSignal` (the `BrowserPage` contract passes
+   * the signal positionally), which is detected at runtime.
+   */
+  async screenshot(
+    optionsOrSignal?: { fullPage?: boolean } | AbortSignal,
+    _signal?: AbortSignal,
+  ): Promise<BrowserScreenshot> {
+    const options = optionsOrSignal instanceof AbortSignal ? undefined : optionsOrSignal
+    const data = await this.page.screenshot({ type: 'png', fullPage: options?.fullPage ?? false })
     const viewport = this.page.viewportSize()
     return {
       mediaType: 'image/png',
@@ -344,7 +374,7 @@ class IntranetPage implements BrowserPage {
   }
 
   async click(ref: string, _signal?: AbortSignal): Promise<BrowserActionResult> {
-    await this.locatorFor(ref).click({ timeout: 30_000 })
+    await this.locatorFor(ref).click({ timeout: this.getConfig().interactionTimeoutMs ?? 30_000 })
     return { url: this.page.url(), ok: true }
   }
 
@@ -354,12 +384,12 @@ class IntranetPage implements BrowserPage {
   }
 
   async fill(ref: string, value: string, _signal?: AbortSignal): Promise<BrowserActionResult> {
-    await this.locatorFor(ref).fill(value, { timeout: 30_000 })
+    await this.locatorFor(ref).fill(value, { timeout: this.getConfig().interactionTimeoutMs ?? 30_000 })
     return { url: this.page.url(), ok: true }
   }
 
   async press(key: string, ref?: string, _signal?: AbortSignal): Promise<BrowserActionResult> {
-    if (ref) await this.locatorFor(ref).press(key, { timeout: 30_000 })
+    if (ref) await this.locatorFor(ref).press(key, { timeout: this.getConfig().interactionTimeoutMs ?? 30_000 })
     else await this.page.keyboard.press(key)
     return { url: this.page.url(), ok: true }
   }
@@ -384,7 +414,9 @@ class IntranetPage implements BrowserPage {
   }
 
   async wait(options?: BrowserWaitOptions, signal?: AbortSignal): Promise<BrowserActionResult> {
-    const ms = Math.max(0, Math.min(options?.ms ?? 1000, 60_000))
+    // The tools layer already clamps `ms` to the current `maxWaitMs` config;
+    // no hard cap here so hot-reloaded values above 60s take effect.
+    const ms = Math.max(0, options?.ms ?? 1000)
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(resolve, ms)
       signal?.addEventListener('abort', () => {
@@ -393,7 +425,7 @@ class IntranetPage implements BrowserPage {
       }, { once: true })
     })
     if (options?.load) {
-      await this.page.waitForLoadState('domcontentloaded', { timeout: 60_000 })
+      await this.page.waitForLoadState('domcontentloaded', { timeout: this.getConfig().navigationTimeoutMs ?? 60_000 })
     }
     return { url: this.page.url(), ok: true }
   }
@@ -403,12 +435,12 @@ class IntranetPage implements BrowserPage {
   }
 
   async back(_signal?: AbortSignal): Promise<BrowserNavigateResult> {
-    await this.page.goBack({ waitUntil: 'domcontentloaded', timeout: 60_000 })
+    await this.page.goBack({ waitUntil: 'domcontentloaded', timeout: this.getConfig().navigationTimeoutMs ?? 60_000 })
     return { url: this.page.url(), statusCode: null, title: (await this.page.title()) || null }
   }
 
   async forward(_signal?: AbortSignal): Promise<BrowserNavigateResult> {
-    await this.page.goForward({ waitUntil: 'domcontentloaded', timeout: 60_000 })
+    await this.page.goForward({ waitUntil: 'domcontentloaded', timeout: this.getConfig().navigationTimeoutMs ?? 60_000 })
     return { url: this.page.url(), statusCode: null, title: (await this.page.title()) || null }
   }
 

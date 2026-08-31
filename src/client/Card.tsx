@@ -30,6 +30,7 @@ export function IntranetBrowserCard(props: IntranetBrowserCardProps): ReactEleme
   if (!state.available) return null
   const blocked = !state.dirty || state.invalid || state.saving || !state.writable
   const approvalMode = state.fields.approvalMode.value || 'per-call'
+  const approvalScope = state.fields.approvalScope.value || 'all'
   const blockMetadata = state.fields.blockMetadata.value === '' ? true : state.fields.blockMetadata.value === 'true'
   const visibility = state.fields.windowVisibility.value || 'visible'
   const stealth = state.fields.stealth.value === '' ? true : state.fields.stealth.value === 'true'
@@ -77,6 +78,26 @@ export function IntranetBrowserCard(props: IntranetBrowserCardProps): ReactEleme
                   <option value="arm">{t('arm')}</option>
                 </select>
               </label>
+              <label style={fieldStyle}>
+                <span>
+                  {t('approvalScope')}
+                  {state.fields.approvalScope.overridden
+                    ? (
+                        <button type="button" onClick={() => { props.resetField('approvalScope') }} style={{ marginLeft: 8 }}>
+                          {t('reset')}
+                        </button>
+                      )
+                    : null}
+                </span>
+                <select
+                  style={inputStyle}
+                  value={approvalScope}
+                  onChange={(event) => { props.edit('approvalScope', event.target.value) }}
+                >
+                  <option value="all">{t('scopeAll')}</option>
+                  <option value="navigation">{t('scopeNavigation')}</option>
+                </select>
+              </label>
               <label style={{ ...fieldStyle, flexDirection: 'row', alignItems: 'center' }}>
                 <input
                   type="checkbox"
@@ -91,6 +112,24 @@ export function IntranetBrowserCard(props: IntranetBrowserCardProps): ReactEleme
                       </button>
                     )
                   : null}
+              </label>
+              <label style={fieldStyle}>
+                <span>
+                  {t('blockedHostnames')}
+                  {state.fields.blockedHostnames.overridden
+                    ? (
+                        <button type="button" onClick={() => { props.resetField('blockedHostnames') }} style={{ marginLeft: 8 }}>
+                          {t('reset')}
+                        </button>
+                      )
+                    : null}
+                </span>
+                <textarea
+                  style={{ ...inputStyle, minHeight: 64, resize: 'vertical', fontFamily: 'monospace' }}
+                  value={state.fields.blockedHostnames.value}
+                  placeholder={'10.0.0.7\ninternal.corp'}
+                  onChange={(event) => { props.edit('blockedHostnames', event.target.value) }}
+                />
               </label>
               <label style={fieldStyle}>
                 <span>

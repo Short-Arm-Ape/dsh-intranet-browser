@@ -4,7 +4,7 @@ import { en, NS, zh } from './locales.ts'
 
 export const inject = ['slots', 'locale', 'settingsScope']
 
-const FIELDS = ['approvalMode', 'blockMetadata', 'windowVisibility', 'stealth'] as const
+const FIELDS = ['approvalMode', 'approvalScope', 'blockMetadata', 'blockedHostnames', 'windowVisibility', 'stealth'] as const
 
 export function apply(ctx: DshClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'intranet-browser: settings card copy')

@@ -3,10 +3,12 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  blockReasonForUrl,
   createIntranetUrlCheck,
   IntranetUrlError,
   METADATA_HOSTNAMES,
   METADATA_IPS,
+  normalizeHostname,
 } from '../src/url-check.js'
 
 const check = (overrides: Parameters<typeof createIntranetUrlCheck>[0] = {}) =>
@@ -94,5 +96,82 @@ describe('intranet url-check — the deliberate SSRF-guard bypass', () => {
       check({ allowFile: true }).assertUsableUrl('file:///C:/temp/index.html').protocol,
       'file:',
     )
+  })
+})
+
+describe('metadata blocklist normalization', () => {
+  it('normalizeHostname strips brackets, lowercases, and drops trailing dots', () => {
+    assert.equal(normalizeHostname('Metadata.Google.Internal.'), 'metadata.google.internal')
+    assert.equal(normalizeHostname('[FD00:EC2::254]'), 'fd00:ec2::254')
+    assert.equal(normalizeHostname('169.254.169.254.'), '169.254.169.254')
+  })
+
+  it('normalizeHostname maps IPv4-mapped IPv6 back to the embedded IPv4 literal', () => {
+    // WHATWG URL renders [::ffff:169.254.169.254] as the hex form ::ffff:a9fe:a9fe
+    assert.equal(normalizeHostname('::ffff:a9fe:a9fe'), '169.254.169.254')
+    assert.equal(normalizeHostname('::ffff:169.254.169.254'), '169.254.169.254')
+    assert.equal(normalizeHostname('::ffff:7f00:1'), '127.0.0.1')
+  })
+
+  it('blocks trailing-dot metadata hostnames', () => {
+    assert.throws(() => check().assertUsableUrl('http://metadata.google.internal./'), IntranetUrlError)
+  })
+
+  it('blocks integer / hex / octal IPv4 variants of the metadata IP', () => {
+    // The WHATWG URL parser normalizes these to the dotted quad before we match.
+    for (const url of [
+      'http://2852039166/', // 169.254.169.254 as a 32-bit integer
+      'http://0xa9fea9fe/', // hex form
+      'http://0251.0376.0251.0376/', // octal-ish dotted form
+    ]) {
+      assert.throws(
+        () => check().assertUsableUrl(url),
+        (e: unknown) => (e as IntranetUrlError).code === 'WEB_BLOCKED_URL',
+        url,
+      )
+    }
+  })
+
+  it('blocks IPv4-mapped IPv6 forms of the metadata IP', () => {
+    for (const url of ['http://[::ffff:169.254.169.254]/', 'http://[::ffff:a9fe:a9fe]/']) {
+      assert.throws(
+        () => check().assertUsableUrl(url),
+        (e: unknown) => (e as IntranetUrlError).code === 'WEB_BLOCKED_URL',
+        url,
+      )
+    }
+  })
+
+  it('blocks vendor metadata endpoints (Tencent / Aliyun / Azure)', () => {
+    for (const url of [
+      'http://metadata.tencentyun.com/',
+      'http://100.100.100.200/',
+      'http://metadata.azure.internal/',
+    ]) {
+      assert.throws(
+        () => check().assertUsableUrl(url),
+        (e: unknown) => (e as IntranetUrlError).code === 'WEB_BLOCKED_URL',
+        url,
+      )
+    }
+  })
+})
+
+describe('blockReasonForUrl — request-level blocklist', () => {
+  it('returns a reason for blocked hosts and null for allowed ones', () => {
+    assert.ok(blockReasonForUrl('http://169.254.169.254/latest/meta-data/'))
+    assert.ok(blockReasonForUrl('http://metadata.google.internal./'))
+    assert.ok(blockReasonForUrl('http://2852039166/'))
+    assert.equal(blockReasonForUrl('http://example.com/'), null)
+    assert.equal(blockReasonForUrl('http://10.0.0.1/'), null)
+  })
+
+  it('honors blockMetadata: false and extra blocked hostnames', () => {
+    assert.equal(blockReasonForUrl('http://169.254.169.254/', { blockMetadata: false }), null)
+    assert.ok(blockReasonForUrl('http://router.home/', { blockedHostnames: new Set(['router.home']) }))
+  })
+
+  it('fails open on unparseable URLs (the strict navigation check still covers the initial goto)', () => {
+    assert.equal(blockReasonForUrl('not a url'), null)
   })
 })

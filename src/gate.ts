@@ -29,14 +29,26 @@ export type ApprovalPolicy = 'ask' | 'never'
 
 /** Pure, unit-testable decision: what should the gate do for one tool call? */
 export type GateAction =
-  | { kind: 'pass' } // not ours, already armed / disarming, or full-access session
-  | { kind: 'ask-arm' } // intranet_arm: always ask, then arm on approval
-  | { kind: 'ask' } // every other intranet_* call when approval is required
+  | { kind: 'pass' } // not ours, already armed / disarming, full-access session, or read-only under approvalScope 'navigation'
+  | { kind: 'ask-arm' } // intranet_arm under approvalMode 'arm': always ask, then arm on approval
+  | { kind: 'ask' } // every other gated intranet_* call
   | { kind: 'disarm' } // intranet_disarm: no approval needed
+
+/**
+ * Read-only tools: under `approvalScope: 'navigation'` they run without a
+ * prompt (they cannot move the browser to a new origin).
+ */
+export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
+  'intranet_snapshot',
+  'intranet_screenshot',
+  'intranet_scroll',
+  'intranet_wait',
+  'intranet_list_tabs',
+])
 
 export function gateAction(
   toolName: string,
-  config: Pick<Config, 'approvalMode'>,
+  config: Pick<Config, 'approvalMode' | 'approvalScope'>,
   isArmed: boolean,
   policy: ApprovalPolicy = 'ask',
 ): GateAction {
@@ -45,7 +57,12 @@ export function gateAction(
   // Full-access sessions auto-approve: the user opted out of approval prompts
   // at the session level (approval policy 'never').
   if (policy === 'never') return { kind: 'pass' }
-  if (toolName === 'intranet_arm') return { kind: 'ask-arm' }
+  if (toolName === 'intranet_arm') {
+    // Arming only means something under approvalMode 'arm'; under 'per-call'
+    // it is a documented no-op, so it must not trigger a pointless prompt.
+    return config.approvalMode === 'arm' ? { kind: 'ask-arm' } : { kind: 'pass' }
+  }
+  if (config.approvalScope === 'navigation' && READ_ONLY_TOOLS.has(toolName)) return { kind: 'pass' }
   if (config.approvalMode === 'arm' && isArmed) return { kind: 'pass' }
   return { kind: 'ask' }
 }
@@ -111,30 +128,41 @@ export interface GateDeps {
 /** Register the `tools/pre-execute` gate covering every `intranet_*` tool. */
 export function registerApprovalGate(ctx: Context, deps: GateDeps): void {
   const { getConfig, armState } = deps
-  const approval = ctx.get('approval') as ApprovalLike | undefined
 
   const ask = async (
     exec: { agent?: unknown; callId?: unknown; signal?: AbortSignal },
     toolName: string,
     args: unknown,
   ): Promise<ApprovalOutcome | undefined> => {
+    // Resolve the approval service per call (not once at registration): the
+    // host may (re)provide it later, and this survives HMR of the provider.
+    const approval = ctx.get('approval') as ApprovalLike | undefined
     // Fail closed: without an agent or an approval service there is no way to
     // get user consent, so the call must not run.
-    if (!approval || !exec.agent) return undefined
+    if (!approval || !exec.agent) {
+      ctx.logger?.warn('[intranet-browser] %s denied: %s', toolName, !approval ? 'no approval service' : 'no agent in execution context')
+      return undefined
+    }
     try {
-      return await approval.request({
+      const outcome = await approval.request({
         agent: exec.agent,
         toolName,
         callId: exec.callId,
         reason: approvalReason(toolName, args),
         signal: exec.signal,
       })
-    } catch {
+      ctx.logger?.info('[intranet-browser] %s approval outcome: %s', toolName, outcome)
+      return outcome
+    } catch (error) {
+      // An approval-service failure must never let the call run; log it so
+      // repeated denials are diagnosable instead of silently swallowed.
+      ctx.logger?.warn('[intranet-browser] %s approval request threw: %s', toolName, String(error))
       return undefined
     }
   }
 
   ctx.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
+    const approval = ctx.get('approval') as ApprovalLike | undefined
     const policy = sessionApprovalPolicy(approval, exec.agent)
     const action = gateAction(
       exec.name,
@@ -146,13 +174,17 @@ export function registerApprovalGate(ctx: Context, deps: GateDeps): void {
       case 'pass':
         return next()
       case 'disarm': {
-        if (exec.agent?.id) armState.disarm(exec.agent.id)
+        if (exec.agent?.id) {
+          armState.disarm(exec.agent.id)
+          ctx.logger?.info('[intranet-browser] disarmed agent %s', exec.agent.id)
+        }
         return next()
       }
       case 'ask-arm': {
         const outcome = await ask(exec, exec.name, exec.arguments)
         if (outcome === 'allowed-once' && exec.agent?.id) {
           armState.arm(exec.agent.id)
+          ctx.logger?.info('[intranet-browser] armed agent %s', exec.agent.id)
           return next()
         }
         return { kind: 'deny', reason: 'Intranet browser activation was not approved.' }

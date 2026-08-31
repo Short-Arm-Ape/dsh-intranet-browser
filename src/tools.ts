@@ -11,13 +11,25 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { defineTool } from '@deepseek-ai/dsh-tools'
+import { defineTool, type JsonValue } from '@deepseek-ai/dsh-tools'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type { BrowserPage, BrowserPageOptions } from '@yeesy369/dsh-browser'
 import type { Config } from './config.js'
-import type { IntranetBrowserRuntime } from './runtime.js'
+import type { IntranetBrowserRuntime, IntranetPage } from './runtime.js'
 
-/** Pull a stable session key from the tool execution context. */
+/**
+ * Registration-time tool timeout. Tools whose real bound is config-driven
+ * (maxWaitMs / navigationTimeoutMs / interactionTimeoutMs) use this generous
+ * hang guard, because `defineTool`'s `timeoutMs` is fixed at registration and
+ * cannot track hot-reloaded config; the runtime enforces the actual bound.
+ */
+const HANG_GUARD_MS = 300_000
+
+/**
+ * Pull a stable session key from the tool execution context.
+ * (Note: runtime.ts has a separate helper with the same name that reads
+ * `BrowserPageOptions.sessionKey` — different shape, different call site.)
+ */
 export function sessionKeyOf(exec: { session?: unknown; agent?: unknown }): string {
   const session = exec.session
   if (typeof session === 'object' && session !== null && 'id' in session) {
@@ -117,7 +129,7 @@ export function registerIntranetTools(ctx: Context, deps: ToolsDeps): void {
         text: `Opened ${value.url}${typeof value.status === 'number' ? ` (HTTP ${value.status})` : ''}${value.title ? ` — ${value.title}` : ''}`,
       }],
     },
-    timeoutMs: 60_000,
+    timeoutMs: HANG_GUARD_MS,
     async execute(args, exec) {
       const page = await currentPage(exec)
       const result = await page.navigate(args.url, exec.signal)
@@ -151,7 +163,9 @@ export function registerIntranetTools(ctx: Context, deps: ToolsDeps): void {
   tools.register(defineTool({
     name: 'intranet_screenshot',
     description: `Capture a screenshot of the current intranet browser page as a durable image attachment. ${NOTE}`,
-    parameters: {},
+    parameters: {
+      fullPage: { type: 'boolean', description: 'Capture the full scrollable page instead of just the viewport. Defaults to false.' },
+    },
     output: {
       schema: {
         type: 'object',
@@ -166,9 +180,11 @@ export function registerIntranetTools(ctx: Context, deps: ToolsDeps): void {
       },
       render: (_args, value) => screenshotBlocks(value),
     },
-    async execute(_args, exec) {
+    async execute(args, exec) {
       const page = await currentPage(exec)
-      const shot = await page.screenshot(exec.signal)
+      // The BrowserPage contract only accepts a signal; the fullPage option is
+      // a concrete IntranetPage extension, so cast for that path.
+      const shot = await (page as IntranetPage).screenshot(args.fullPage ? { fullPage: true } : undefined, exec.signal)
       const ref: ImageAttachmentRef = await attachments.saveImage({
         data: shot.data,
         mediaType: shot.mediaType,
@@ -195,7 +211,7 @@ export function registerIntranetTools(ctx: Context, deps: ToolsDeps): void {
       ...actionOutput,
       render: (_args, value) => [{ type: 'text', text: `Clicked (ok=${value.ok}) at ${value.url}` }],
     },
-    timeoutMs: 30_000,
+    timeoutMs: HANG_GUARD_MS,
     async execute(args, exec) {
       const page = await currentPage(exec)
       const result = await page.click(args.ref, exec.signal)
@@ -232,7 +248,7 @@ export function registerIntranetTools(ctx: Context, deps: ToolsDeps): void {
       ...actionOutput,
       render: (_args, value) => [{ type: 'text', text: `Filled (ok=${value.ok}) at ${value.url}` }],
     },
-    timeoutMs: 30_000,
+    timeoutMs: HANG_GUARD_MS,
     async execute(args, exec) {
       const page = await currentPage(exec)
       const result = await page.fill(args.ref, args.value, exec.signal)
@@ -251,7 +267,7 @@ export function registerIntranetTools(ctx: Context, deps: ToolsDeps): void {
       ...actionOutput,
       render: (_args, value) => [{ type: 'text', text: `Pressed (ok=${value.ok}) at ${value.url}` }],
     },
-    timeoutMs: 30_000,
+    timeoutMs: HANG_GUARD_MS,
     async execute(args, exec) {
       const page = await currentPage(exec)
       const result = await page.press(args.key, args.ref, exec.signal)
@@ -308,7 +324,10 @@ export function registerIntranetTools(ctx: Context, deps: ToolsDeps): void {
       ...actionOutput,
       render: (_args, value) => [{ type: 'text', text: `Waited (ok=${value.ok}) at ${value.url}` }],
     },
-    timeoutMs: Math.max(getConfig().maxWaitMs, 60_000) + 5_000,
+    // Hang guard only: the real bound is maxWaitMs, read from the CURRENT
+    // config inside execute (hot-reload safe). The old registration-time
+    // `max(maxWaitMs, 60s) + 5s` silently truncated waits above 60s.
+    timeoutMs: HANG_GUARD_MS,
     async execute(args, exec) {
       const page = await currentPage(exec)
       const ms = Math.max(0, Math.min(args.ms ?? 1000, getConfig().maxWaitMs))
@@ -328,7 +347,7 @@ export function registerIntranetTools(ctx: Context, deps: ToolsDeps): void {
         text: `Went back to ${value.url}${value.title ? ` — ${value.title}` : ''}`,
       }],
     },
-    timeoutMs: 60_000,
+    timeoutMs: HANG_GUARD_MS,
     async execute(_args, exec) {
       const page = await currentPage(exec)
       const result = await page.back(exec.signal)
@@ -347,11 +366,122 @@ export function registerIntranetTools(ctx: Context, deps: ToolsDeps): void {
         text: `Went forward to ${value.url}${value.title ? ` — ${value.title}` : ''}`,
       }],
     },
-    timeoutMs: 60_000,
+    timeoutMs: HANG_GUARD_MS,
     async execute(_args, exec) {
       const page = await currentPage(exec)
       const result = await page.forward(exec.signal)
       return { url: result.url, title: result.title ?? '' }
+    },
+  }))
+
+  tools.register(defineTool({
+    name: 'intranet_list_tabs',
+    description: `List tabs in the current harness session. ${NOTE}`,
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          tabs: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                id: { type: 'string', required: true },
+                url: { type: 'string' },
+                title: { type: 'string' },
+                active: { type: 'boolean', required: true },
+              },
+            },
+          },
+        },
+        additionalProperties: false,
+      },
+      render: (_args, value) => {
+        const tabs = (value as { tabs: Array<{ id: string; url?: string; title?: string; active: boolean }> }).tabs
+        return [{ type: 'text', text: tabs.map((tab) => `${tab.active ? '*' : ' '} ${tab.id} ${tab.url ?? ''} ${tab.title ?? ''}`.trim()).join('\n') || '(no tabs)' }]
+      },
+    },
+    async execute(_args, exec) {
+      const tabs = await browser.listTabs(sessionKeyOf(exec), exec.signal)
+      return {
+        tabs: tabs.map((tab) => ({
+          id: tab.id,
+          url: tab.url ?? undefined,
+          title: tab.title ?? undefined,
+          active: tab.active,
+        })),
+      }
+    },
+  }))
+
+  tools.register(defineTool({
+    name: 'intranet_open_tab',
+    description: `Open a new tab in the current harness session and optionally navigate it. ${NOTE}`,
+    parameters: {
+      url: { type: 'string', description: 'Optional HTTP(S) URL to open in the new tab.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', required: true },
+          url: { type: 'string', required: true },
+          title: { type: 'string', required: true },
+        },
+        additionalProperties: false,
+      },
+      render: (_args, value) => [{ type: 'text', text: `Opened tab ${value.id} at ${value.url}` }],
+    },
+    timeoutMs: HANG_GUARD_MS,
+    async execute(args, exec) {
+      const page = await browser.openTab(pageOptions(exec), exec.signal)
+      if (args.url) {
+        const result = await page.navigate(args.url, exec.signal)
+        return { id: page.id, url: result.url, title: result.title ?? '' }
+      }
+      return { id: page.id, url: page.url() ?? '', title: (await page.title()) ?? '' }
+    },
+  }))
+
+  tools.register(defineTool({
+    name: 'intranet_switch_tab',
+    description: `Switch to a tab listed by intranet_list_tabs. ${NOTE}`,
+    parameters: {
+      id: { type: 'string', required: true, description: 'Tab id from intranet_list_tabs.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', required: true },
+          url: { type: 'string', required: true },
+        },
+        additionalProperties: false,
+      },
+      render: (_args, value) => [{ type: 'text', text: `Switched to ${value.id} at ${value.url}` }],
+    },
+    async execute(args, exec) {
+      const page = await browser.switchTab(args.id, sessionKeyOf(exec), exec.signal)
+      return { id: page.id, url: page.url() ?? '' }
+    },
+  }))
+
+  tools.register(defineTool({
+    name: 'intranet_close_tab',
+    description: `Close a tab listed by intranet_list_tabs. ${NOTE}`,
+    parameters: {
+      id: { type: 'string', required: true, description: 'Tab id from intranet_list_tabs.' },
+    },
+    output: {
+      ...actionOutput,
+      render: (_args, value) => [{ type: 'text', text: `Closed tab (ok=${value.ok})` }],
+    },
+    async execute(args, exec) {
+      await browser.closeTab(args.id, sessionKeyOf(exec), exec.signal)
+      return { url: '', ok: true }
     },
   }))
 
@@ -368,6 +498,25 @@ export function registerIntranetTools(ctx: Context, deps: ToolsDeps): void {
       return { url: '', ok: true }
     },
   }))
+
+  if (getConfig().evaluate) {
+    tools.register(defineTool({
+      name: 'intranet_evaluate',
+      description: `Run a raw JavaScript expression in the current intranet browser page and return the JSON-serializable result. HIGH RISK: enable only when you trust the page and gate it behind approval. ${NOTE}`,
+      parameters: {
+        script: { type: 'string', required: true, description: 'The JavaScript expression to evaluate. Must return a JSON-serializable value.' },
+      },
+      output: {
+        schema: { type: 'json' },
+        render: (_args, value) => [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }],
+      },
+      timeoutMs: HANG_GUARD_MS,
+      async execute(args, exec) {
+        const page = await currentPage(exec)
+        return (await page.evaluate(args.script, exec.signal)) as JsonValue
+      },
+    }))
+  }
 
   tools.register(defineTool({
     name: 'intranet_arm',
