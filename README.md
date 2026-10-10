@@ -1,3 +1,12 @@
+> **⚠️ 本仓库已停止维护（2026-10-10）。**
+> 它的价值已经并入 [`Short-Arm-Ape/dsh-browser-unified`](https://github.com/Short-Arm-Ape/dsh-browser-unified)：
+> 内网放行语义（元数据黑名单 / hostname 归一 / 分域 allow）收编进 core 的 `url-policy`，
+> 审批决策表（`approvalMode: per-call | arm`、fail-closed）收编进 core 的 `approval.ts`，
+> "内网档"现在由 unified 插件的 `lanAccess` / `localAccess` 表达。
+> 唯一**未**并入的是逐请求 route 拦截（页面自身 XHR / 重定向 / iframe）—— 那件事在 unified 线里
+> 是设计条目 **de-005（accepted）**，且换到"扩展 + CDP 桥"路线后需要重写，不能照搬 Playwright 的 `context.route`。
+> 本仓库保持只读归档；不再接受改动。
+
 # dsh-intranet-browser
 Bypasses the SSRF protection of `@yeesy369/dsh-browser-playwright`
 
